@@ -104,14 +104,9 @@ uv sync
 
 ```dotenv
 # 必須
-DISCORD_TOKEN=あなたのDiscordBotトークン
+TOKEN=あなたのDiscordBotトークン
 
-# 任意（実装に合わせて）
-COMMAND_PREFIX=$
-
-# 外部API（使用するAPIに合わせて）
-F1_API_BASE_URL=https://ergast.com/api/f1
-F1_API_KEY=
+NEWS_CHANNEL_ID=あなたのF1 ニュース Channel
 ```
 
 ---
@@ -152,3 +147,4 @@ Bot をサーバーへ招待し、必要な権限（特に MESSAGE CONTENT INTEN
 
 - ライセンス: プロジェクトに合わせて記載してください
 - Discord ライブラリ（discord.py）に感謝します
+
