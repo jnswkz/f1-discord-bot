@@ -78,15 +78,8 @@ powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | ie
 ```
 
 3) 仮想環境と依存関係
-- requirements.txt がある場合:
-```bash
-uv venv
-# macOS/Linux
-source .venv/bin/activate
-# Windows
-# .\.venv\Scripts\activate
-
-uv pip install -r requirements.txt
+```
+uv sync
 ```
 
 - pyproject.toml がある場合でも Poetry は不要です。uv でインストールできます:
@@ -147,4 +140,5 @@ Bot をサーバーへ招待し、必要な権限（特に MESSAGE CONTENT INTEN
 
 - ライセンス: プロジェクトに合わせて記載してください
 - Discord ライブラリ（discord.py）に感謝します
+
 
