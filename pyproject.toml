@@ -9,4 +9,5 @@ dependencies = [
     "bs4>=0.0.2",
     "discord>=2.3.2",
     "dotenv>=0.9.9",
+    "pandas>=2.3.3",
 ]
