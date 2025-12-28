@@ -674,7 +674,7 @@ async def run_replay(
         pos_df = await get_position(session, session_key, cache=cache)
         ov_df = await get_overtakes(session, session_key, cache=cache) if include_overtakes else None
         laps_df = await get_laps(session, session_key, cache=cache)
-        car_df = await get_car_data(session, session_key, cache=cache)
+        # car_df = await get_car_data(session, session_key, cache=cache)
 
     state.pit_windows = build_pit_windows(pit_df, pre_buffer_s=2.0, post_buffer_s=25.0)
 
@@ -689,7 +689,7 @@ async def run_replay(
         pad_after_s=3,
     )
     rc_map, pit_map, pos_map, ov_map = build_event_maps(rc_df, pit_df, pos_df, ov_df)
-    speed_lookup = build_speed_per_second(car_df, agg="mean")
+    # speed_lookup = build_speed_per_second(car_df, agg="mean")
     
     return replay(
         driver_t,
