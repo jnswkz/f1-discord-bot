@@ -92,6 +92,10 @@ async def get_laps(session: aiohttp.ClientSession, session_key: str, *, cache: b
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    for c in ["st_speed", "i1_speed", "i2_speed"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
     if "is_pit_out_lap" in df.columns:
         df["is_pit_out_lap"] = df["is_pit_out_lap"].astype("boolean")
 
@@ -197,7 +201,142 @@ async def get_car_data(session: aiohttp.ClientSession, session_key: str, *, cach
         return df
     df = bucket_to_seconds(df, "date")
     df["driver_number"] = pd.to_numeric(df.get("driver_number"), errors="coerce").astype("Int64")
-    df["speed"] = pd.to_numeric(df.get("speed"), errors="coerce")
+    for c in ["speed", "throttle", "brake", "rpm"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if "n_gear" in df.columns:
+        df["n_gear"] = pd.to_numeric(df["n_gear"], errors="coerce").astype("Int64")
+
+    if "drs" in df.columns:
+        df["drs"] = pd.to_numeric(df["drs"], errors="coerce").astype("Int64")
+
+    return df
+
+
+async def get_stints(session: aiohttp.ClientSession, session_key: str, *, cache: bool = True) -> pd.DataFrame:
+    data = await fetch_json(
+        session,
+        "stints",
+        {"session_key": session_key},
+        cache=cache,
+        cache_name="stints.json",
+    )
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+
+    df["driver_number"] = pd.to_numeric(df.get("driver_number"), errors="coerce").astype("Int64")
+    for c in ["lap_start", "lap_end", "stint_number", "tyre_age_at_start"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+
+    if "tyre_compound" in df.columns:
+        df["tyre_compound"] = df["tyre_compound"].astype("string")
+
+    return df
+
+
+async def get_team_radio(session: aiohttp.ClientSession, session_key: str, *, cache: bool = True) -> pd.DataFrame:
+    data = await fetch_json(
+        session,
+        "team_radio",
+        {"session_key": session_key},
+        cache=cache,
+        cache_name="team_radio.json",
+    )
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+
+    df = bucket_to_seconds(df, "date")
+    df["driver_number"] = pd.to_numeric(df.get("driver_number"), errors="coerce").astype("Int64")
+    return df
+
+
+async def get_weather(session: aiohttp.ClientSession, session_key: str, *, cache: bool = True) -> pd.DataFrame:
+    data = await fetch_json(
+        session,
+        "weather",
+        {"session_key": session_key},
+        cache=cache,
+        cache_name="weather.json",
+    )
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+
+    df = bucket_to_seconds(df, "date")
+    numeric_cols = [
+        "air_temperature",
+        "humidity",
+        "pressure",
+        "rainfall",
+        "track_temperature",
+        "wind_direction",
+        "wind_speed",
+    ]
+    for c in numeric_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+async def get_location(session: aiohttp.ClientSession, session_key: str, *, cache: bool = True) -> pd.DataFrame:
+    data = await fetch_json(
+        session,
+        "location",
+        {"session_key": session_key},
+        cache=cache,
+        cache_name="location.json",
+    )
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+
+    df = bucket_to_seconds(df, "date")
+    df["driver_number"] = pd.to_numeric(df.get("driver_number"), errors="coerce").astype("Int64")
+    for c in ["x", "y", "z"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+async def get_starting_grid(session: aiohttp.ClientSession, session_key: str, *, cache: bool = True) -> pd.DataFrame:
+    data = await fetch_json(
+        session,
+        "starting_grid",
+        {"session_key": session_key},
+        cache=cache,
+        cache_name="starting_grid.json",
+    )
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+
+    df["driver_number"] = pd.to_numeric(df.get("driver_number"), errors="coerce").astype("Int64")
+    for c in ["position", "grid_position"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+    return df
+
+
+async def get_session_result(session: aiohttp.ClientSession, session_key: str, *, cache: bool = True) -> pd.DataFrame:
+    data = await fetch_json(
+        session,
+        "session_result",
+        {"session_key": session_key},
+        cache=cache,
+        cache_name="session_result.json",
+    )
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+
+    df["driver_number"] = pd.to_numeric(df.get("driver_number"), errors="coerce").astype("Int64")
+    for c in ["position", "starting_position", "points", "laps", "interval", "time_retired"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
 
