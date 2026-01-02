@@ -1,5 +1,6 @@
 import asyncio
 import os
+from typing import Optional
 
 import aiohttp
 import pandas as pd
@@ -9,6 +10,9 @@ from services.openf1data import (
     get_car_data,
     get_laps,
     get_location,
+    get_pit,
+    build_pit_windows,
+    build_gap_closing_windows,
     get_session_intervals,
     get_session_result,
     get_starting_grid,
@@ -29,6 +33,43 @@ def fmt_pairs(pairs):
     return ", ".join(f"#{a}->{v}" for a, v in pairs)
 
 
+def fmt_finished(items):
+    # items: [(driver, position or None), ...]
+    out = []
+    for dn, pos in items:
+        if pos:
+            out.append(f"P{pos} #{dn}")
+        else:
+            out.append(f"#{dn}")
+    return ", ".join(out)
+
+
+def fmt_closing(items):
+    parts = []
+    for item in items:
+        if isinstance(item, dict):
+            pair = item.get("pair")
+            if not pair:
+                continue
+            a, b = pair
+            gain = item.get("total_gain_s")
+            start = item.get("start_gap_s")
+            end = item.get("end_gap_s")
+            detail = (
+                f"(-{gain:.2f}s; {start:.1f}s->{end:.1f}s)"
+                if gain is not None and start is not None and end is not None
+                else ""
+            )
+            parts.append(f"#{a}->{b} {detail}".strip())
+        else:
+            try:
+                a, b = item
+                parts.append(f"#{a}->{b}")
+            except Exception:
+                continue
+    return ", ".join(parts)
+
+
 async def fetch_all_endpoints(session: aiohttp.ClientSession, session_key: str):
     coros = {
         "laps": get_laps(session, session_key, cache=True),
@@ -37,61 +78,33 @@ async def fetch_all_endpoints(session: aiohttp.ClientSession, session_key: str):
         "weather": get_weather(session, session_key, cache=True),
         "car_data": get_car_data(session, session_key, cache=True),
         "location": get_location(session, session_key, cache=True),
-        # Always re-fetch bookends to avoid stale/missing cache
-        "starting_grid": get_starting_grid(session, session_key, cache=False),
-        "session_result": get_session_result(session, session_key, cache=False),
+        # Use cached bookends if present; fetch if missing
+        "starting_grid": get_starting_grid(session, session_key, cache=True),
+        "session_result": get_session_result(session, session_key, cache=True),
     }
     results = await asyncio.gather(*coros.values())
     return {name: df for name, df in zip(coros.keys(), results)}
-
-
-def derive_positions_from_intervals(driver_t: pd.DataFrame, ts: pd.Timestamp) -> pd.DataFrame:
-    """
-    Derive an ordered grid/result using gap_to_leader at a given timestamp.
-    """
-    if driver_t is None or driver_t.empty:
-        return pd.DataFrame()
-    slice_df = driver_t.loc[driver_t["t"] == ts, ["driver_number", "gap_to_leader_s"]].copy()
-    if slice_df.empty:
-        return pd.DataFrame()
-    slice_df["gap_to_leader_s"] = pd.to_numeric(slice_df["gap_to_leader_s"], errors="coerce")
-    ordered = slice_df.sort_values("gap_to_leader_s", na_position="last").reset_index(drop=True)
-    ordered["position"] = ordered.index + 1
-    return ordered[["position", "driver_number", "gap_to_leader_s"]]
-
-
-def print_positions(label: str, df: pd.DataFrame):
-    if df is None or df.empty:
-        print(f"{label}: no data")
-        return
-    rows = [f"P{int(r.position)} #{int(r.driver_number)} (gap {r.gap_to_leader_s:.3f}s)"
-            if pd.notna(r.gap_to_leader_s) else f"P{int(r.position)} #{int(r.driver_number)}"
-            for r in df.itertuples(index=False)]
-    print(f"{label}: " + " | ".join(rows))
 
 
 async def main():
     async with aiohttp.ClientSession() as session:
         all_data = await fetch_all_endpoints(session, SESSION_KEY)
         driver_t, _ = await get_session_intervals(session, SESSION_KEY, cache=True)
+        pit_df = await get_pit(session, SESSION_KEY, cache=True)
 
     print("Fetched OpenF1 datasets:")
     for name, df in all_data.items():
         print(f"- {name}: {len(df)} rows")
 
-    # Fallback: derive starting grid and final order from intervals if missing
-    if all_data["starting_grid"].empty or all_data["session_result"].empty:
-        if driver_t is None or driver_t.empty:
-            print("No interval data to derive grid/result.")
-        else:
-            first_t = driver_t["t"].min()
-            last_t = driver_t["t"].max()
-            derived_grid = derive_positions_from_intervals(driver_t, first_t)
-            derived_result = derive_positions_from_intervals(driver_t, last_t)
-            if all_data["starting_grid"].empty:
-                print_positions("Derived starting grid (from first interval)", derived_grid)
-            if all_data["session_result"].empty:
-                print_positions("Derived session result (from last interval)", derived_result)
+    pit_windows = build_pit_windows(pit_df, pre_buffer_s=2.0, post_buffer_s=25.0)
+    closing_windows = build_gap_closing_windows(driver_t, pit_windows, min_gain_s=1.0, min_duration_s=3)
+    print(f"Computed gap-closing windows for {len(closing_windows)} pairs.")
+    # show a small sample
+    for pair, wins in list(closing_windows.items())[:5]:
+        preview = ", ".join(
+            f"{w['start']} -> {w['end']} (-{w['total_gain_s']:.2f}s)" for w in wins[:3]
+        ) or "none"
+        print(f"  #{pair[0]} vs #{pair[1]}: {len(wins)} windows; sample: {preview}")
 
     state = ReplayState()
     snapshot_df, events_by_t = await run_replay(
@@ -118,27 +131,36 @@ async def main():
         real_pairs = info["real_pairs"]
         ctx_pairs = info["ctx_pairs"]
         storm = info["storm"]
+        gap_closing = info.get("gap_closing", [])
+        finished = info.get("finished", [])
         slow = slow_by_t.get(t, [])
 
-        if not pit and not real_pairs and not ctx_pairs:
+        if not pit and not real_pairs and not gap_closing and not finished:
             continue
 
         parts = []
-        if pit:
-            parts.append(f"pit: {fmt_drivers(pit)}")
+        # if pit:
+        #     parts.append(f"pit: {fmt_drivers(pit)}")
 
-        if real_pairs:
-            parts.append(f"overtake(real): {fmt_pairs(real_pairs)}")
+        # if real_pairs:
+        #     parts.append(f"overtake(real): {fmt_pairs(real_pairs)}")
 
-        if ctx_pairs:
-            label = "overtake(ctx-storm)" if storm else "overtake(ctx)"
-            parts.append(f"{label}: {fmt_pairs(ctx_pairs)}")
+        # if ctx_pairs:
+        #     label = "overtake(ctx-storm)" if storm else "overtake(ctx)"
+        #     parts.append(f"{label}: {fmt_pairs(ctx_pairs)}")
 
+        # if gap_closing:
+        #     parts.append(f"closing: {fmt_closing(gap_closing)}")
 
-        if slow:
-            # show speed next to driver
-            parts.append(f"slow: {fmt_drivers(slow)}")
-        print("Events:", " | ".join(parts))
+        if finished:
+            parts.append(f"finished: {fmt_finished(finished)}")
+
+        # if slow:
+        #     # show speed next to driver
+        #     parts.append(f"slow: {fmt_drivers(slow)}")
+
+        if parts:
+            print("Events:", " | ".join(parts))  # this will sent to LLM for generating commentary
 
 
 if __name__ == "__main__":

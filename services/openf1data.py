@@ -6,7 +6,7 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
 
 import aiohttp
 import dotenv
@@ -31,6 +31,9 @@ class ReplayState:
 
     pit_windows: Dict[int, List[Tuple[pd.Timestamp, pd.Timestamp]]] = field(default_factory=dict)
     slow_windows: Dict[int, List[Tuple[pd.Timestamp, pd.Timestamp]]] = field(default_factory=dict)
+    finished_drivers: Set[int] = field(default_factory=set)
+    finished_at: Dict[int, pd.Timestamp] = field(default_factory=dict)
+    finished_position: Dict[int, int] = field(default_factory=dict)
 
     last_position: Dict[int, int] = field(default_factory=dict)
 
@@ -67,6 +70,46 @@ async def fetch_json(
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
         await asyncio.sleep(0.5 * attempt)
+
+    print(f"Failed to fetch {url} after {retries} attempts (last status {last_error})")
+    return []
+
+async def fetch_json_openf1(
+    session: aiohttp.ClientSession,
+    path: str,
+    params: dict,
+    *,
+    cache: bool = True,
+    cache_name: Optional[str] = None,
+    retries: int = 2,
+) -> List[dict]:
+    """
+    Fallback fetch that targets the public OpenF1 API directly.
+    """
+    cache_file = _cache_path(str(params.get("session_key", "")), cache_name) if cache and cache_name else None
+    if cache_file and cache_file.exists():
+        cached = json.loads(cache_file.read_text())
+        if cached:
+            return cached
+
+    url = f"https://api.openf1.org/v1/{path.lstrip('/')}"
+    last_error: Optional[str] = None
+    for attempt in range(1, retries + 1):
+        try:
+            async with session.get(url, params=params) as response:
+                print(f"Fetching OpenF1 API: {url} with params {params} (attempt {attempt})")
+
+                last_error = str(response.status)
+                if response.status == 200:
+                    payload = await response.json()
+                    if cache_file:
+                        cache_file.parent.mkdir(parents=True, exist_ok=True)
+                        cache_file.write_text(json.dumps(payload, indent=2))
+                    print(payload)
+                    return payload
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+        await asyncio.sleep(0.25 * attempt)
 
     print(f"Failed to fetch {url} after {retries} attempts (last status {last_error})")
     return []
@@ -303,7 +346,8 @@ async def get_location(session: aiohttp.ClientSession, session_key: str, *, cach
 
 
 async def get_starting_grid(session: aiohttp.ClientSession, session_key: str, *, cache: bool = True) -> pd.DataFrame:
-    data = await fetch_json(
+    # Always prefer the public OpenF1 API and cache locally
+    data = await fetch_json_openf1(
         session,
         "starting_grid",
         {"session_key": session_key},
@@ -322,7 +366,8 @@ async def get_starting_grid(session: aiohttp.ClientSession, session_key: str, *,
 
 
 async def get_session_result(session: aiohttp.ClientSession, session_key: str, *, cache: bool = True) -> pd.DataFrame:
-    data = await fetch_json(
+    # Always prefer the public OpenF1 API and cache locally
+    data = await fetch_json_openf1(
         session,
         "session_result",
         {"session_key": session_key},
@@ -638,6 +683,45 @@ def build_slow_windows_hybrid(
     return _merge_windows(windows)
 
 
+def _build_window_map_seconds(
+    windows: Dict[Tuple[int, int], List[dict]],
+    *,
+    per_second: bool = True,
+    min_gain_s: float = 0.0,
+    min_gain_rate_s_per_s: float = 0.0,
+    include_payload: bool = False,
+) -> Dict[pd.Timestamp, List[Any]]:
+    """
+    Expand pair windows into a lookup for replay annotation.
+
+    per_second=True => include every second inside the window.
+    per_second=False => only include the window start timestamp.
+    """
+    per_t: Dict[pd.Timestamp, List[Tuple[int, int]]] = defaultdict(list)
+    for pair, ws in windows.items():
+        for w in ws:
+            start = w.get("start")
+            end = w.get("end")
+            if pd.isna(start) or pd.isna(end):
+                continue
+            tg = float(w.get("total_gain_s", 0) or 0)
+            gr = float(w.get("avg_gain_rate_s_per_s", 0) or 0)
+            if tg < min_gain_s or gr < min_gain_rate_s_per_s:
+                continue
+            payload = {
+                "pair": pair,
+                "start_gap_s": w.get("start_gap_s"),
+                "end_gap_s": w.get("end_gap_s"),
+                "total_gain_s": tg,
+            } if include_payload else pair
+            if per_second:
+                for t in pd.date_range(start, end, freq="1s"):
+                    per_t[t].append(payload)
+            else:
+                per_t[start].append(payload)
+    return per_t
+
+
 def is_in_windows(
     windows: Dict[int, List[Tuple[pd.Timestamp, pd.Timestamp]]],
     dn: int,
@@ -653,12 +737,247 @@ def is_in_pit(state: ReplayState, dn: int, t: pd.Timestamp) -> bool:
     return is_in_windows(state.pit_windows, dn, t)
 
 
+def is_in_pit_buffered(state: ReplayState, dn: int, t: pd.Timestamp, *, linger_after_s: float = 3.0) -> bool:
+    """
+    Stronger pit filter: true during pit window AND for linger_after_s seconds after exit.
+    """
+    for s, e in state.pit_windows.get(int(dn), []):
+        if s <= t <= e:
+            return True
+        if t > e and (t - e) <= pd.to_timedelta(linger_after_s, unit="s"):
+            return True
+    return False
+
+
 def is_slow(state: ReplayState, dn: int, t: pd.Timestamp) -> bool:
     return is_in_windows(state.slow_windows, dn, t)
 
 
 def is_bad_context(state: ReplayState, dn: int, t: pd.Timestamp) -> bool:
-    return is_in_pit(state, dn, t) or is_slow(state, dn, t)
+    return is_in_pit_buffered(state, dn, t) or is_slow(state, dn, t)
+
+
+def build_finished_drivers(session_result_df: pd.DataFrame) -> Set[int]:
+    """
+    Determine which drivers finished the race using session_result feed.
+    """
+    if session_result_df is None or session_result_df.empty:
+        return set()
+
+    df = session_result_df.copy()
+    df["driver_number"] = pd.to_numeric(df.get("driver_number"), errors="coerce").astype("Int64")
+
+    finished_mask = pd.Series(False, index=df.index)
+
+    if "status" in df.columns:
+        finished_mask |= df["status"].astype(str).str.lower().str.contains("finish|chequer")
+
+    if "time_retired" in df.columns:
+        finished_mask |= df["time_retired"].isna()
+
+    if "position" in df.columns:
+        finished_mask |= df["position"].notna()
+
+    drivers = df.loc[finished_mask, "driver_number"].dropna().astype(int)
+    return set(drivers.tolist())
+
+
+def build_finished_positions(session_result_df: pd.DataFrame) -> Dict[int, int]:
+    """
+    Extract classified finishing positions by driver.
+    """
+    if session_result_df is None or session_result_df.empty:
+        return {}
+    df = session_result_df.copy()
+    df["driver_number"] = pd.to_numeric(df.get("driver_number"), errors="coerce").astype("Int64")
+    df["position"] = pd.to_numeric(df.get("position"), errors="coerce").astype("Int64")
+    df = df.dropna(subset=["driver_number", "position"])
+    return {int(r.driver_number): int(r.position) for r in df.itertuples(index=False)}
+
+
+def is_finished_race(state: ReplayState, dn: int, t: Optional[pd.Timestamp] = None) -> bool:
+    dn = int(dn)
+    if t is not None and dn in state.finished_at:
+        return t >= state.finished_at[dn]
+    return dn in state.finished_drivers
+
+def build_gap_closing_windows(
+    driver_t: pd.DataFrame,
+    pit_windows: Dict[int, List[Tuple[pd.Timestamp, pd.Timestamp]]],
+    *,
+    min_gain_s: float = 2.0,
+    min_duration_s: int = 3,
+    min_gain_rate_s_per_s: float = 0.05,  # ~= 5.0s per 100s (~lap)
+    per_step_tolerance_s: float = 0.05,
+    max_gap_s: Optional[float] = 60.0,
+    ffill_limit_s: Optional[int] = 180,
+    finished_at: Optional[Dict[int, pd.Timestamp]] = None,
+    allowed_drivers: Optional[Set[int]] = None,
+    pit_linger_s: float = 3.0,
+) -> Dict[Tuple[int, int], List[dict]]:
+    """
+    Detect windows where a trailing car reduces the gap to a leading car.
+
+    - Uses gap_to_leader_s from driver_t (per-second).
+    - Resets/terminates windows when either car is in pit_windows.
+    - Only records runs that last >= min_duration_s, gain >= min_gain_s,
+      and average gain rate >= min_gain_rate_s_per_s. This catches both
+      lap-scale (e.g., ~2s/lap) and short bursts (e.g., 1s in 10-20s).
+    - ffill_limit_s keeps leader gaps alive after the last packet so late closings still register.
+    """
+    if driver_t is None or driver_t.empty:
+        return {}
+
+    g = driver_t.copy()
+    if g.empty:
+        return {}
+
+    g["driver_number"] = g["driver_number"].astype(int)
+    finished_at = finished_at or {}
+    pivot = g.pivot(index="t", columns="driver_number", values="gap_to_leader_s").sort_index()
+    if ffill_limit_s is not None:
+        pivot = pivot.ffill(limit=ffill_limit_s)
+    pivot = pivot.dropna(how="all")
+    drivers = list(pivot.columns)
+    allowed = set(int(d) for d in allowed_drivers) if allowed_drivers else None
+
+    windows: Dict[Tuple[int, int], List[dict]] = defaultdict(list)
+    state: Dict[Tuple[int, int], dict] = {}
+
+    def flush(key: Tuple[int, int]):
+        st = state.get(key)
+        if not st or not st.get("active"):
+            return
+        start_t = st.get("start_t")
+        end_t = st.get("last_t")
+        start_gap = st.get("start_gap")
+        end_gap = st.get("last_gap")
+        if start_t is None or end_t is None or start_gap is None or end_gap is None:
+            return
+        duration = (end_t - start_t).total_seconds()
+        total_gain = start_gap - end_gap
+        gain_rate = total_gain / duration if duration > 0 else 0
+        if duration >= min_duration_s and total_gain >= min_gain_s and gain_rate >= min_gain_rate_s_per_s:
+            windows[key].append(
+                {
+                    "start": start_t,
+                    "end": end_t,
+                    "start_gap_s": start_gap,
+                    "end_gap_s": end_gap,
+                    "total_gain_s": total_gain,
+                    "avg_gain_rate_s_per_s": gain_rate,
+                }
+            )
+        st["active"] = False
+        st["start_t"] = None
+        st["start_gap"] = None
+
+    for t in pivot.index:
+        # Skip timestep entirely if no usable data
+        for i in range(len(drivers)):
+            for j in range(i + 1, len(drivers)):
+                dn_a = int(drivers[i])
+                dn_b = int(drivers[j])
+                if allowed and (dn_a not in allowed or dn_b not in allowed):
+                    continue
+                gap_a = pivot.at[t, dn_a]
+                gap_b = pivot.at[t, dn_b]
+
+                if pd.isna(gap_a) or pd.isna(gap_b) or gap_a == gap_b:
+                    key = (min(dn_a, dn_b), max(dn_a, dn_b))
+                    flush(key)
+                    if key in state:
+                        state[key]["last_gap"] = None
+                        state[key]["last_t"] = None
+                    continue
+
+                trailing, leading, trailing_gap, leading_gap = (
+                    (dn_a, dn_b, gap_a, gap_b) if gap_a > gap_b else (dn_b, dn_a, gap_b, gap_a)
+                )
+                pair_gap = trailing_gap - leading_gap
+                key = (trailing, leading)
+
+                if key not in state:
+                    state[key] = {
+                        "active": False,
+                        "start_t": None,
+                        "start_gap": None,
+                        "last_gap": None,
+                        "last_t": None,
+                    }
+                st = state[key]
+
+                def _in_pit_strong(dn: int) -> bool:
+                    for s, e in pit_windows.get(int(dn), []):
+                        if s <= t <= e:
+                            return True
+                        if t > e and (t - e) <= pd.to_timedelta(pit_linger_s, unit="s"):
+                            return True
+                    return False
+
+                in_pit = _in_pit_strong(trailing) or _in_pit_strong(leading)
+                finished_now = (
+                    (trailing in finished_at and t >= finished_at[trailing])
+                    or (leading in finished_at and t >= finished_at[leading])
+                )
+                if in_pit or finished_now or pd.isna(pair_gap) or (max_gap_s is not None and pair_gap > max_gap_s):
+                    flush(key)
+                    st["last_gap"] = None
+                    st["last_t"] = None
+                    continue
+
+                prev_gap = st.get("last_gap")
+                prev_t = st.get("last_t")
+
+                if prev_gap is None or prev_t is None:
+                    st["last_gap"] = float(pair_gap)
+                    st["last_t"] = t
+                    continue
+
+                delta = prev_gap - pair_gap  # >0 means closing
+
+                if st.get("active"):
+                    if delta >= -per_step_tolerance_s:
+                        st["last_gap"] = float(pair_gap)
+                        st["last_t"] = t
+                    else:
+                        flush(key)
+                        st["last_gap"] = float(pair_gap)
+                        st["last_t"] = t
+                    continue
+
+                if delta > per_step_tolerance_s:
+                    st["active"] = True
+                    st["start_t"] = prev_t
+                    st["start_gap"] = prev_gap
+                    st["last_gap"] = float(pair_gap)
+                    st["last_t"] = t
+                else:
+                    st["last_gap"] = float(pair_gap)
+                    st["last_t"] = t
+
+    # flush any active windows at the end
+    for key in list(state.keys()):
+        flush(key)
+
+    # # export to per-second map
+    # per_second_map: Dict[pd.Timestamp, List[dict]] = {}
+    # for pair, ws in windows.items():
+    #     for w in ws:
+    #         start = w.get("start")
+    #         end = w.get("end")
+    #         if pd.isna(start) or pd.isna(end):
+    #             continue
+    #         for t in pd.date_range(start, end, freq="1s"):
+    #             if t not in per_second_map:
+    #                 per_second_map[t] = []
+    #             per_second_map[t].append(pair)
+
+    # #export to file for viewing
+    
+    # with open("gap_closing_per_second.json", "w") as f:
+    #     json.dump({str(k): v for k, v in per_second_map.items()}, f, indent=2)
+    return windows
 
 
 def build_event_maps(
@@ -692,6 +1011,9 @@ def replay(
     *,
     overtake_storm_count: int = 6,
     return_event_summary: bool = False,
+    gap_closing_map: Optional[Dict[pd.Timestamp, List[Tuple[int, int]]]] = None,
+    gap_closing_starts: Optional[Dict[pd.Timestamp, List[Tuple[int, int]]]] = None,
+    finished_drivers: Optional[Set[int]] = None,
     # speed_lookup: Optional[pd.Series] = None,
 ) -> Any:
     if driver_t is None or driver_t.empty:
@@ -699,6 +1021,9 @@ def replay(
         return (empty, {}) if return_event_summary else empty
 
     state = state or ReplayState()
+    if finished_drivers:
+        state.finished_drivers = set(finished_drivers)
+    finished_at = state.finished_at or {}
     t_index = list(driver_t["t"].dropna().sort_values().unique())
     drivers = [int(d) for d in pd.Series(driver_t["driver_number"]).dropna().unique()]
     gap_lookup = driver_t.set_index(["t", "driver_number"])["gap_to_leader_s"]
@@ -723,6 +1048,20 @@ def replay(
         overtake_events = [e for e in events if e.get("kind") == "overtake"]
 
         stormy = len(overtake_events) >= overtake_storm_count
+        closing_pairs = gap_closing_map.get(t, []) if gap_closing_map else []
+        # drop pairs where either driver is in/just-exited pit (extra guard)
+        closing_pairs = [
+            pair
+            for pair in closing_pairs
+            if not (is_in_pit_buffered(state, pair[0], t) or is_in_pit_buffered(state, pair[1], t))
+        ]
+        if state.track_flag and str(state.track_flag).lower().startswith("chequer"):
+            closing_pairs = []
+        finished_set = state.finished_drivers
+        finished_now = sorted(
+            [(dn, state.finished_position.get(dn)) for dn, ft in finished_at.items() if ft == t],
+            key=lambda x: (x[1] if x[1] is not None else 999, x[0]),
+        )
 
         # classify overtakes
         real_pairs: List[Tuple[int, int]] = []
@@ -755,6 +1094,8 @@ def replay(
                 "real_pairs": real_pairs,
                 "ctx_pairs": ctx_pairs,
                 "storm": stormy,
+                "gap_closing": gap_closing_starts.get(t, []) if gap_closing_starts else [],
+                "finished": finished_now,
                 # "sx_speed_kmh": speed_map,
             }
 
@@ -764,6 +1105,8 @@ def replay(
         real_against = {v for _, v in real_pairs}
         ctx_for = {a for a, _ in ctx_pairs}
         ctx_against = {v for _, v in ctx_pairs}
+        closing_for = {a for a, _ in closing_pairs}
+        closing_against = {v for _, v in closing_pairs}
 
         for dn in drivers:
             gap = gap_lookup.get((t, dn), pd.NA)
@@ -789,6 +1132,9 @@ def replay(
                     "overtake_ctx_for": dn in ctx_for,
                     "overtake_ctx_against": dn in ctx_against,
                     "overtake_storm": stormy,
+                    "closing_gap_for": dn in closing_for,
+                    "closing_gap_against": dn in closing_against,
+                    "finished": (dn in finished_at and t >= finished_at[dn]) or dn in finished_set,
                     # "sx_speed_kmh": speed_kmh,
                 }
             )
@@ -813,9 +1159,125 @@ async def run_replay(
         pos_df = await get_position(session, session_key, cache=cache)
         ov_df = await get_overtakes(session, session_key, cache=cache) if include_overtakes else None
         laps_df = await get_laps(session, session_key, cache=cache)
+        session_result_df = await get_session_result(session, session_key, cache=cache)
         # car_df = await get_car_data(session, session_key, cache=cache)
 
     state.pit_windows = build_pit_windows(pit_df, pre_buffer_s=2.0, post_buffer_s=25.0)
+
+    # Chequered flag time (use to trigger finish events together)
+    chequered_t: Optional[pd.Timestamp] = None
+    if rc_df is not None and not rc_df.empty:
+        rc_track = rc_df[(rc_df.get("scope") == "Track") & (rc_df.get("category") == "Flag")]
+        if not rc_track.empty and "flag" in rc_track.columns:
+            flags = rc_track.dropna(subset=["flag"])
+            flags["flag_lower"] = flags["flag"].astype(str).str.lower()
+            cheq = flags[flags["flag_lower"].str.contains("chequer|checkered|chequered", regex=True)]
+            if not cheq.empty:
+                chequered_t = pd.to_datetime(cheq.sort_values("t")["t"].iloc[0])
+
+    drivers_from_gap: Set[int] = set()
+    clean_gap = pd.DataFrame()
+    if driver_t is not None and not driver_t.empty:
+        clean_gap = driver_t.dropna(subset=["t", "driver_number", "gap_to_leader_s"]).astype({"driver_number": int})
+        drivers_from_gap = set(int(d) for d in clean_gap["driver_number"].dropna().unique())
+
+    # Finished timing: prefer position feed (last timestamp seen), fallback to gap feed
+    state.finished_at = {}
+    pos_clean = None
+    best_gap_finish_t: Optional[pd.Timestamp] = None
+    if pos_df is not None and not pos_df.empty:
+        pos_clean = pos_df.dropna(subset=["t", "driver_number", "position"]).astype({"driver_number": int})
+        last_seen_pos = pos_clean.groupby("driver_number")["t"].max()
+        state.finished_at = last_seen_pos.to_dict()
+    elif driver_t is not None and not driver_t.empty:
+        clean = driver_t.dropna(subset=["t", "driver_number", "gap_to_leader_s"]).astype({"driver_number": int})
+        if not clean.empty:
+            counts = clean.groupby("t")["driver_number"].nunique()
+            if not counts.empty:
+                best_gap_finish_t = counts.idxmax()
+                state.finished_at = {int(r.driver_number): best_gap_finish_t for r in clean[clean["t"] == best_gap_finish_t].itertuples(index=False)}
+
+    state.finished_drivers = build_finished_drivers(session_result_df) or set(state.finished_at.keys())
+    state.finished_position = build_finished_positions(session_result_df)
+
+    # Fallback finishing positions: use final position snapshot, then gap ordering
+    if not state.finished_position:
+        if pos_clean is not None and not pos_clean.empty:
+            latest_per_driver = (
+                pos_clean.sort_values("t")
+                .drop_duplicates(subset=["driver_number"], keep="last")
+                .dropna(subset=["position"])
+            )
+            final_pos = latest_per_driver.sort_values("position")
+            state.finished_position = {int(r.driver_number): int(r.position) for r in final_pos.itertuples(index=False)}
+        elif not clean_gap.empty:
+            if best_gap_finish_t is None:
+                counts = clean_gap.groupby("t")["driver_number"].nunique()
+                if not counts.empty:
+                    best_gap_finish_t = counts.idxmax()
+            last_t = best_gap_finish_t if best_gap_finish_t is not None else clean_gap["t"].max()
+            derived = (
+                clean_gap.loc[clean_gap["t"] == last_t, ["driver_number", "gap_to_leader_s"]]
+                .dropna()
+                .sort_values("gap_to_leader_s", na_position="last")
+            )
+            state.finished_position = {int(r.driver_number): i + 1 for i, r in enumerate(derived.itertuples(index=False))}
+
+    # If derived list is shorter than available drivers, rebuild from gap feed
+    if not clean_gap.empty and drivers_from_gap and len(state.finished_position) < len(drivers_from_gap):
+        target_t = best_gap_finish_t
+        if target_t is None:
+            counts = clean_gap.groupby("t")["driver_number"].nunique()
+            if not counts.empty:
+                target_t = counts.idxmax()
+        if target_t is None:
+            target_t = clean_gap["t"].max()
+        derived = (
+            clean_gap.loc[clean_gap["t"] == target_t, ["driver_number", "gap_to_leader_s"]]
+            .dropna()
+            .sort_values("gap_to_leader_s", na_position="last")
+        )
+        state.finished_position = {int(r.driver_number): i + 1 for i, r in enumerate(derived.itertuples(index=False))}
+
+    # Normalize finish timestamps to the end of the timing stream so finish events fire together
+    # and avoid spurious mid-race "finished" when a driver simply drops off the feed.
+    # If we have a chequered flag timestamp, align finish detection to it
+    if chequered_t is not None and drivers_from_gap:
+        state.finished_at = {int(dn): chequered_t for dn in drivers_from_gap}
+    elif state.finished_position and not clean_gap.empty:
+        common_finish_t = pd.to_datetime(best_gap_finish_t if best_gap_finish_t is not None else clean_gap["t"].max())
+        state.finished_at = {int(dn): common_finish_t for dn in state.finished_position.keys()}
+
+    top_finishers = {dn for dn, pos in state.finished_position.items() if pos and pos <= 10}
+
+    best_pos_set: Set[int] = set()
+    if pos_df is not None and not pos_df.empty:
+        pos_clean = pos_df.dropna(subset=["driver_number", "position", "t"]).astype({"driver_number": int, "position": int})
+        best_pos = pos_clean.groupby("driver_number")["position"].min()
+        best_pos_set = {int(dn) for dn, p in best_pos.items() if p <= 12}
+        leaders = {int(r.driver_number) for r in pos_clean[pos_clean["position"] == 1].itertuples(index=False)}
+        best_pos_set |= leaders
+
+    allowed_top = top_finishers or best_pos_set or None
+
+    closing_windows = build_gap_closing_windows(
+        driver_t,
+        state.pit_windows,
+        finished_at=state.finished_at,
+        allowed_drivers=allowed_top,
+        pit_linger_s=3.0,
+    )
+    gap_closing_map = _build_window_map_seconds(
+        closing_windows,
+        per_second=True,
+    )
+    gap_closing_starts = _build_window_map_seconds(
+        closing_windows,
+        per_second=False,
+        min_gain_s=2.5,
+        min_gain_rate_s_per_s=0.04,
+        include_payload=True,
+    )
 
     state.slow_windows = build_slow_windows_hybrid(
         driver_t,
@@ -839,5 +1301,8 @@ async def run_replay(
         ov_map,
         state=state,
         return_event_summary=return_event_summary,
+        gap_closing_map=gap_closing_map,
+        gap_closing_starts=gap_closing_starts,
+        finished_drivers=state.finished_drivers,
         # speed_lookup=speed_lookup,
     )
