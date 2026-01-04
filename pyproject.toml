@@ -7,7 +7,15 @@ requires-python = ">=3.13"
 dependencies = [
     "aiohttp>=3.12.15",
     "bs4>=0.0.2",
+    "chromadb>=1.4.0",
     "discord>=2.3.2",
     "dotenv>=0.9.9",
+    "google-generativeai==0.3.2",
+    "iprogress>=0.4",
+    "langchain>=1.2.0",
+    "langchain-community>=0.4.1",
+    "langchain-text-splitters>=1.1.0",
     "pandas>=2.3.3",
+    "pypdf2>=3.0.1",
+    "python-docx>=1.2.0",
 ]
