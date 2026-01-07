@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 from task.generate_openning import generate_openning
 from task.generate_grid_cmt import generate_grid_commentary
+from task.generate_result import generate_result_commentary
 
 SYSTEM_PROMPT = """あなたは熱狂的な日本語F1実況者です。
 必ず日本語で回答してください。
@@ -31,17 +32,19 @@ def get_oppening_commentary(country, year):
 async def get_grid_commentary(session):
     return await generate_grid_commentary(session, SYSTEM_PROMPT, model)
 
+async def get_result_commentary(session):
+    return await generate_result_commentary(session, SYSTEM_PROMPT, model)
 
 
 async def main():
     # config()
     async with aiohttp.ClientSession() as session:
-        grid_commentary = await generate_grid_commentary(session, SYSTEM_PROMPT, model)
-        print("=== Grid Commentary ===")
-        print(grid_commentary)
+        result_cmt = await get_result_commentary(session)
+        print("=== Result Commentary ===")
+        print(result_cmt)
 
 if __name__ == "__main__":
     config()
-    # asyncio.run(main() )
+    asyncio.run(main() )
 
     
