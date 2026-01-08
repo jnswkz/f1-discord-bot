@@ -6,6 +6,7 @@ import google.generativeai as genai
 from task.generate_openning import generate_openning
 from task.generate_grid_cmt import generate_grid_commentary
 from task.generate_result import generate_result_commentary
+from task.generate_event_cmt import generate_event_commentary
 
 SYSTEM_PROMPT = """あなたは熱狂的な日本語F1実況者です。
 必ず日本語で回答してください。
@@ -34,6 +35,9 @@ async def get_grid_commentary(session):
 
 async def get_result_commentary(session):
     return await generate_result_commentary(session, SYSTEM_PROMPT, model)
+
+def get_event_commentary(event_df):
+    return generate_event_commentary(event_df, SYSTEM_PROMPT, model)
 
 
 async def main():
