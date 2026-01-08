@@ -32,6 +32,7 @@ from services.openf1data import (
 )
 
 from commentary_bot.bot import (
+    config as configure_gemini,
     get_oppening_commentary,
     get_grid_commentary,
     get_result_commentary,
@@ -66,15 +67,40 @@ class RaceEvent:
 class ReplayManager:
     """Manages race replay state and event batching for Discord."""
     
-    def __init__(self, session_key: str, channel: discord.TextChannel, batch_size: int = 5):
+    def __init__(self, session_key: str, channel: discord.TextChannel, batch_size: int = 5,
+                 country: str = "Great Britain", year: str = "2020"):
         self.session_key = session_key
         self.channel = channel
         self.batch_size = batch_size
+        self.country = country
+        self.year = year
         self.events_by_t: Dict[pd.Timestamp, dict] = {}
         self.current_batch: List[RaceEvent] = []
         self.is_running = False
         self.replay_speed = 1.0  # 1.0 = realtime, 0.1 = 10x speed
+        self.race_finished = False  # Track if we've seen a finish event
         
+    async def _send_commentary(self, commentary: str, title: str = None):
+        """Send commentary to channel, splitting by --- for Discord limits."""
+        if not commentary:
+            return
+        
+        # Split by --- delimiter
+        parts = [p.strip() for p in commentary.split("---") if p.strip()]
+        
+        for i, part in enumerate(parts):
+            if len(part) > 1900:
+                # Further split if too long
+                chunks = [part[j:j+1900] for j in range(0, len(part), 1900)]
+                for chunk in chunks:
+                    await self.channel.send(chunk)
+            else:
+                await self.channel.send(part)
+            
+            # Small delay between parts
+            if i < len(parts) - 1:
+                await asyncio.sleep(0.5)
+    
     async def load_replay_data(self) -> bool:
         """Load all replay data from the session."""
         try:
@@ -208,38 +234,37 @@ class ReplayManager:
 Keep it brief (2-3 sentences), energetic, and mention key drivers by number."""
         return prompt
     
-    async def _send_batch(self, batch: List[RaceEvent]):
-        """Send a batch of events to the Discord channel."""
+    async def _send_batch(self, batch: List[RaceEvent]) -> bool:
+        """Send a batch of events to the Discord channel with LLM commentary.
+        
+        Returns:
+            True if a finish event was detected in this batch.
+        """
         if not batch:
-            return
+            return False
         
-        # Format for display
-        formatted = self._format_batch_for_commentary(batch)
+        # Check for finish events
+        has_finish = any(e.event_type == "finished" for e in batch)
         
-        # Get timestamp range
-        timestamps = [e.timestamp for e in batch]
-        start_t = min(timestamps)
-        end_t = max(timestamps)
+        # Sort batch by priority
+        sorted_batch = sorted(batch)
         
-        if start_t == end_t:
-            time_str = start_t.strftime("%H:%M:%S")
-        else:
-            time_str = f"{start_t.strftime('%H:%M:%S')} - {end_t.strftime('%H:%M:%S')}"
+        # Create list of description strings for LLM
+        event_strings = [e.description for e in sorted_batch]
         
-        embed = discord.Embed(
-            title=f"Race Events",
-            description=formatted,
-            color=discord.Color.red(),
-        )
-        embed.set_footer(text=f"{time_str}")
+        # Generate LLM commentary
+        try:
+            commentary = get_event_commentary(event_strings)
+            await self._send_commentary(commentary)
+        except Exception as e:
+            # Fallback: send raw events if LLM fails
+            formatted = self._format_batch_for_commentary(batch)
+            await self.channel.send(f"**Events:**\n{formatted}")
+            print(f"Event commentary error: {e}")
         
-        await self.channel.send(embed=embed)
-        
-        # Also send LLM prompt (for debugging/integration)
-        # llm_prompt = self._format_batch_for_llm(batch)
-        # await self.channel.send(f"```\n{llm_prompt}\n```")
+        return has_finish
     
-    async def run(self, speed: float = 0.1):
+    async def run(self, speed: float = 1):
         """
         Run the replay second by second.
         
@@ -248,9 +273,38 @@ Keep it brief (2-3 sentences), energetic, and mention key drivers by number."""
         """
         self.is_running = True
         self.replay_speed = speed
+        self.race_finished = False
         
         await self.channel.send(f"**Starting race replay for session {self.session_key}**")
         
+        # Step 1: Opening commentary
+        await self.channel.send("**[OPENING]**")
+        try:
+            opening = get_oppening_commentary(self.country, self.year)
+            await self._send_commentary(opening)
+        except Exception as e:
+            await self.channel.send(f"Opening commentary failed: {e}")
+        
+        await asyncio.sleep(1)
+        
+        # Step 2: Grid commentary
+        await self.channel.send("**[STARTING GRID]**")
+        try:
+            async with aiohttp.ClientSession() as session:
+                grid_cmt = await get_grid_commentary(session)
+                await self._send_commentary(grid_cmt)
+        except Exception as e:
+            await self.channel.send(f"Grid commentary failed: {e}")
+        
+        await asyncio.sleep(1)
+        
+        # Step 3: Race start message
+        await self.channel.send("**[RACE START]**")
+        await self.channel.send("Lights out and away we go!")
+        
+        await asyncio.sleep(1)
+        
+        # Step 4: Process events
         sorted_times = sorted(self.events_by_t.keys())
         if not sorted_times:
             await self.channel.send("No events found in replay data.")
@@ -285,13 +339,28 @@ Keep it brief (2-3 sentences), energetic, and mention key drivers by number."""
             
             # Send batch if we have enough events
             if len(self.current_batch) >= self.batch_size:
-                await self._send_batch(self.current_batch)
+                has_finish = await self._send_batch(self.current_batch)
+                if has_finish:
+                    self.race_finished = True
                 self.current_batch = []
                 await asyncio.sleep(speed)
         
         # Send remaining events
         if self.current_batch:
-            await self._send_batch(self.current_batch)
+            has_finish = await self._send_batch(self.current_batch)
+            if has_finish:
+                self.race_finished = True
+        
+        # Step 5: Result commentary (after finish detected)
+        if self.race_finished:
+            await asyncio.sleep(1)
+            await self.channel.send("**[RACE RESULT]**")
+            try:
+                async with aiohttp.ClientSession() as session:
+                    result_cmt = await get_result_commentary(session)
+                    await self._send_commentary(result_cmt)
+            except Exception as e:
+                await self.channel.send(f"Result commentary failed: {e}")
         
         self.is_running = False
         await self.channel.send("**Replay complete!**")
@@ -308,6 +377,9 @@ active_replays: Dict[int, ReplayManager] = {}  # channel_id -> ReplayManager
 dotenv.load_dotenv()
 TOKEN = os.getenv('TOKEN')
 NEWS_CHANNEL_ID = os.getenv('NEWS_CHANNEL_ID')
+
+# Configure Gemini API for commentary
+configure_gemini()
 
 if not TOKEN:
     raise ValueError("TOKEN environment variable is required")
@@ -466,7 +538,8 @@ async def on_message(message):
         if len(parts) < 2:
             await message.channel.send(
                 "**Race Replay Commands:**\n"
-                "`$replay start <session_key>` - Start replay (e.g., `$replay start 5768`)\n"
+                "`$replay start <session_key> [country] [year]` - Start replay\n"
+                "  Example: `$replay start 5768 \"Great Britain\" 2020`\n"
                 "`$replay stop` - Stop current replay\n"
                 "`$replay speed <0.01-1.0>` - Set replay speed (0.1 = 10x speed)\n"
                 "`$replay status` - Check replay status"
@@ -483,22 +556,46 @@ async def on_message(message):
                 await message.channel.send("A replay is already running in this channel. Use `$replay stop` first.")
                 return
             
-            # Get session key
+            # Parse arguments: $replay start <session_key> [country] [year] [speed]
+            # Handle quoted country names
+            import re
+            full_content = message.content
+            quoted_match = re.search(r'"([^"]+)"', full_content)
+            
             session_key = parts[2] if len(parts) > 2 else SESSION_KEY
-            
-            # Get speed (optional)
+            country = "British"  # default
+            year = "2020"  # default
             speed = 0.1  # default: 10x speed
-            if len(parts) > 3:
-                try:
-                    speed = float(parts[3])
-                    speed = max(0.01, min(1.0, speed))  # clamp between 0.01 and 1.0
-                except ValueError:
-                    pass
             
-            await message.channel.send(f"Loading replay data for session {session_key}...")
+            if quoted_match:
+                country = quoted_match.group(1)
+                # Find remaining args after the quoted string
+                after_quote = full_content.split('"')[-1].strip().split()
+                if after_quote:
+                    year = after_quote[0]
+                if len(after_quote) > 1:
+                    try:
+                        speed = float(after_quote[1])
+                        speed = max(0.01, min(1.0, speed))
+                    except ValueError:
+                        pass
+            else:
+                # No quotes - simple parsing
+                if len(parts) > 3:
+                    country = parts[3]
+                if len(parts) > 4:
+                    year = parts[4]
+                if len(parts) > 5:
+                    try:
+                        speed = float(parts[5])
+                        speed = max(0.01, min(1.0, speed))
+                    except ValueError:
+                        pass
             
-            # Create replay manager
-            replay = ReplayManager(session_key, text_channel, batch_size=5)
+            await message.channel.send(f"Loading replay data for session {session_key} ({country} {year})...")
+            
+            # Create replay manager with country/year
+            replay = ReplayManager(session_key, text_channel, batch_size=5, country=country, year=year)
             
             # Load data
             if await replay.load_replay_data():

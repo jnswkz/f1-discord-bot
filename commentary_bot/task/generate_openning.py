@@ -4,7 +4,7 @@ import google.generativeai as genai
 def get_document(country, year):
     country = country.lower()
     year = str(year)
-    filepath = f"./commentary-bot/document/{country}_gp_{year}.docx"
+    filepath = f"./commentary_bot/document/{country}_gp_{year}.docx"
     doc = Document(filepath)
     full_text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
     return full_text

@@ -3,10 +3,10 @@ import aiohttp
 import os
 from dotenv import load_dotenv
 import google.generativeai as genai
-from task.generate_openning import generate_openning
-from task.generate_grid_cmt import generate_grid_commentary
-from task.generate_result import generate_result_commentary
-from task.generate_event_cmt import generate_event_commentary
+from commentary_bot.task.generate_openning import generate_openning
+from commentary_bot.task.generate_grid_cmt import generate_grid_commentary
+from commentary_bot.task.generate_result import generate_result_commentary
+from commentary_bot.task.generate_event_cmt import generate_event_commentary
 
 SYSTEM_PROMPT = """あなたは熱狂的な日本語F1実況者です。
 必ず日本語で回答してください。
