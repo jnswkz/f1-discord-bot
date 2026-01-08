@@ -36,8 +36,8 @@ async def get_grid_commentary(session):
 async def get_result_commentary(session):
     return await generate_result_commentary(session, SYSTEM_PROMPT, model)
 
-def get_event_commentary(event_df):
-    return generate_event_commentary(event_df, SYSTEM_PROMPT, model)
+def get_event_commentary(event_batch):
+    return generate_event_commentary(event_batch, SYSTEM_PROMPT, model)
 
 
 async def main():

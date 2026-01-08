@@ -31,6 +31,12 @@ from services.openf1data import (
     run_replay,
 )
 
+from commentary_bot.bot import (
+    get_oppening_commentary,
+    get_grid_commentary,
+    get_result_commentary,
+    get_event_commentary
+)
 
 # Event priority for ranking (higher = more important)
 class EventPriority(IntEnum):
