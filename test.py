@@ -29,8 +29,34 @@ def fmt_drivers(nums):
 
 
 def fmt_pairs(pairs):
-    # pairs: [(a,v), ...]
+    # pairs: [(a,v), ...] - simple tuples
     return ", ".join(f"#{a}->{v}" for a, v in pairs)
+
+
+def fmt_overtakes(overtakes):
+    """Format overtakes with zone info if available."""
+    parts = []
+    for ov in overtakes:
+        if isinstance(ov, dict):
+            pair = ov.get("pair")
+            if not pair:
+                continue
+            a, v = pair
+            zone = ov.get("zone")
+            zone_type = ov.get("zone_type")
+            if zone and zone != "Unknown":
+                loc = f" ({zone})" if zone_type == "corner" else f" (on {zone})"
+                parts.append(f"#{a}->{v}{loc}")
+            else:
+                parts.append(f"#{a}->{v}")
+        else:
+            # backwards compat: tuple
+            try:
+                a, v = ov
+                parts.append(f"#{a}->{v}")
+            except Exception:
+                continue
+    return ", ".join(parts)
 
 
 def fmt_finished(items):
@@ -111,6 +137,7 @@ async def main():
         SESSION_KEY,
         cache=True,
         include_overtakes=True,
+        include_overtake_location=True,  # get zone info for overtakes
         state=state,
         return_event_summary=True,
     )
@@ -129,6 +156,7 @@ async def main():
 
         pit = info["pit"]
         real_pairs = info["real_pairs"]
+        real_overtakes = info.get("real_overtakes", [])  # with zone info
         ctx_pairs = info["ctx_pairs"]
         storm = info["storm"]
         gap_closing = info.get("gap_closing", [])
@@ -139,18 +167,21 @@ async def main():
             continue
 
         parts = []
-        # if pit:
-        #     parts.append(f"pit: {fmt_drivers(pit)}")
+        if pit:
+            parts.append(f"pit: {fmt_drivers(pit)}")
 
-        # if real_pairs:
-        #     parts.append(f"overtake(real): {fmt_pairs(real_pairs)}")
+        if real_overtakes:
+            # Use real_overtakes if available (has zone info), else fall back to real_pairs
+            parts.append(f"overtake: {fmt_overtakes(real_overtakes)}")
+        elif real_pairs:
+            parts.append(f"overtake: {fmt_pairs(real_pairs)}")
 
         # if ctx_pairs:
         #     label = "overtake(ctx-storm)" if storm else "overtake(ctx)"
         #     parts.append(f"{label}: {fmt_pairs(ctx_pairs)}")
 
-        # if gap_closing:
-        #     parts.append(f"closing: {fmt_closing(gap_closing)}")
+        if gap_closing:
+            parts.append(f"closing: {fmt_closing(gap_closing)}")
 
         if finished:
             parts.append(f"finished: {fmt_finished(finished)}")

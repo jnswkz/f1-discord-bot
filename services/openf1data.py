@@ -1000,6 +1000,19 @@ def _extract_pair(e: dict) -> Optional[Tuple[int, int]]:
     return (int(a), int(v))
 
 
+def _extract_overtake_info(e: dict) -> Optional[dict]:
+    """Extract overtake pair with zone information if available."""
+    a = e.get("driver_number") or e.get("overtaking_driver_number")
+    v = e.get("overtaken_driver_number") or e.get("victim")
+    if pd.isna(a) or pd.isna(v):
+        return None
+    return {
+        "pair": (int(a), int(v)),
+        "zone": e.get("zone"),
+        "zone_type": e.get("zone_type"),
+    }
+
+
 def replay(
     driver_t: pd.DataFrame,
     synthetic_interval_long: pd.DataFrame,
@@ -1055,7 +1068,8 @@ def replay(
             for pair in closing_pairs
             if not (is_in_pit_buffered(state, pair[0], t) or is_in_pit_buffered(state, pair[1], t))
         ]
-        if state.track_flag and str(state.track_flag).lower().startswith("chequer"):
+        race_over = state.track_flag and str(state.track_flag).lower().startswith("chequer")
+        if race_over:
             closing_pairs = []
         finished_set = state.finished_drivers
         finished_now = sorted(
@@ -1063,22 +1077,45 @@ def replay(
             key=lambda x: (x[1] if x[1] is not None else 999, x[0]),
         )
 
-        # classify overtakes
-        real_pairs: List[Tuple[int, int]] = []
+        # classify overtakes (skip if race is over - cooldown lap overtakes are not relevant)
+        real_overtakes: List[dict] = []  # with zone info
+        ctx_overtakes: List[dict] = []   # with zone info
+        real_pairs: List[Tuple[int, int]] = []  # for backwards compat
         ctx_pairs: List[Tuple[int, int]] = []
 
+        if race_over:
+            overtake_events = []
+
         for e in overtake_events:
-            pair = _extract_pair(e)
-            if pair is None:
+            info = _extract_overtake_info(e)
+            if info is None:
                 continue
+            pair = info["pair"]
             a, v = pair
             if stormy or is_bad_context(state, a, t) or is_bad_context(state, v, t):
                 ctx_pairs.append(pair)
+                ctx_overtakes.append(info)
             else:
                 real_pairs.append(pair)
+                real_overtakes.append(info)
 
-        # dedupe pairs per second
+        # dedupe pairs per second (keep first occurrence with zone info)
+        seen_real = set()
+        deduped_real = []
+        for ov in real_overtakes:
+            if ov["pair"] not in seen_real:
+                seen_real.add(ov["pair"])
+                deduped_real.append(ov)
+        real_overtakes = deduped_real
         real_pairs = sorted(set(real_pairs))
+        
+        seen_ctx = set()
+        deduped_ctx = []
+        for ov in ctx_overtakes:
+            if ov["pair"] not in seen_ctx:
+                seen_ctx.add(ov["pair"])
+                deduped_ctx.append(ov)
+        ctx_overtakes = deduped_ctx
         ctx_pairs = sorted(set(ctx_pairs))
 
         pit_drivers = sorted({int(e.get("driver_number")) for e in pit_events if pd.notna(e.get("driver_number"))})
@@ -1092,7 +1129,9 @@ def replay(
             event_summary[t] = {
                 "pit": pit_drivers,
                 "real_pairs": real_pairs,
+                "real_overtakes": real_overtakes,  # with zone info
                 "ctx_pairs": ctx_pairs,
+                "ctx_overtakes": ctx_overtakes,    # with zone info
                 "storm": stormy,
                 "gap_closing": gap_closing_starts.get(t, []) if gap_closing_starts else [],
                 "finished": finished_now,
@@ -1148,6 +1187,7 @@ async def run_replay(
     *,
     cache: bool = True,
     include_overtakes: bool = False,
+    include_overtake_location: bool = False,
     state: Optional[ReplayState] = None,
     return_event_summary: bool = False,
 ):
@@ -1160,7 +1200,13 @@ async def run_replay(
         ov_df = await get_overtakes(session, session_key, cache=cache) if include_overtakes else None
         laps_df = await get_laps(session, session_key, cache=cache)
         session_result_df = await get_session_result(session, session_key, cache=cache)
+        loc_df = await get_location(session, session_key, cache=cache) if include_overtake_location and include_overtakes else None
         # car_df = await get_car_data(session, session_key, cache=cache)
+
+    # Enrich overtakes with location if requested
+    if ov_df is not None and loc_df is not None and not ov_df.empty and not loc_df.empty:
+        from services.track_zones import enrich_overtakes_with_location
+        ov_df = enrich_overtakes_with_location(ov_df, loc_df)
 
     state.pit_windows = build_pit_windows(pit_df, pre_buffer_s=2.0, post_buffer_s=25.0)
 
@@ -1274,8 +1320,8 @@ async def run_replay(
     gap_closing_starts = _build_window_map_seconds(
         closing_windows,
         per_second=False,
-        min_gain_s=2.5,
-        min_gain_rate_s_per_s=0.04,
+        min_gain_s=10.0,  # only show 10+ second gains (major incidents)
+        min_gain_rate_s_per_s=0.10,  # at least 0.1s/s gain rate
         include_payload=True,
     )
 
