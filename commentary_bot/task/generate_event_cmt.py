@@ -16,7 +16,7 @@ def generate_event_commentary(event_batch, SYSTEMPROMPT, model) -> str:
     commentary = model.generate_content(
         prompt,
         generation_config=genai.GenerationConfig(
-            max_output_tokens=5000000,
+            max_output_tokens=10000,
             temperature=0.7,
         )
     )
