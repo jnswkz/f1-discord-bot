@@ -595,7 +595,7 @@ async def on_message(message):
             await message.channel.send(f"Loading replay data for session {session_key} ({country} {year})...")
             
             # Create replay manager with country/year
-            replay = ReplayManager(session_key, text_channel, batch_size=5, country=country, year=year)
+            replay = ReplayManager(session_key, text_channel, batch_size=10, country=country, year=year)
             
             # Load data
             if await replay.load_replay_data():
